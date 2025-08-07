@@ -19,13 +19,10 @@
 #define LOG_MODULE "Energest"
 #define LOG_LEVEL LOG_LEVEL_INFO
 
-/* Ölçüm periyodu (saniye) - 5 dakika */
-#define MEASUREMENT_INTERVAL (CLOCK_SECOND * 10)
-
 #define UDP_CLIENT_PORT 8765
 #define UDP_SERVER_PORT 5678
 
-#define SENSOR_READING_PERIOD (CLOCK_SECOND * 5)
+#define SENSOR_READING_PERIOD (CLOCK_SECOND * 300)
 
 static struct simple_udp_connection udp_conn;
 static struct ctimer opt_timer, hdc_timer;
@@ -37,6 +34,7 @@ static int optValue = 0;
 
 static uip_ipaddr_t dest_ipaddr;
 
+static int counter = 0;
 
 PROCESS(energest_monitor_process, "Energest Monitor Process");
 AUTOSTART_PROCESSES(&energest_monitor_process);
@@ -146,14 +144,12 @@ send_energest_data(void)
 PROCESS_THREAD(energest_monitor_process, ev, data)
 {
   static struct etimer sensor_timer;
-  static struct etimer energest_timer;
   static char str[128];
   
   PROCESS_BEGIN();
   
   printf("Energest + Sensor UDP Client Started on CC1352R\n");
   printf("Clock frequency: %lu Hz\n", (unsigned long)CLOCK_SECOND);
-  printf("Measurement interval: %d seconds (5 minutes)\n", MEASUREMENT_INTERVAL);
   printf("Node ID: %d\n", node_id);
   
   /* TSCH MAC katmanını başlat */
@@ -168,7 +164,6 @@ PROCESS_THREAD(energest_monitor_process, ev, data)
   
   /* Periyodik timer'ı başlat */
   etimer_set(&sensor_timer, SENSOR_READING_PERIOD);
-  etimer_set(&energest_timer, MEASUREMENT_INTERVAL);
   
   while(1) {
     PROCESS_YIELD();
@@ -181,17 +176,18 @@ PROCESS_THREAD(energest_monitor_process, ev, data)
       }
     } else if(ev == PROCESS_EVENT_TIMER && etimer_expired(&sensor_timer)) {
       snprintf(str, sizeof(str),
-      "{\"is_energest\":0,\"node_id\":%d,\"light\":%d.%02d,\"temperature\":%d.%02d,\"humidity\":%d.%02d}",
+          "{\"is_energest\":0,\"node_id\":%d,\"light\":%d.%02d,\"temperature\":%d.%02d,\"humidity\":%d.%02d}",
           node_id, 
           optValue / 100, optValue % 100,
           tempValue / 100, tempValue % 100,
           humidValue / 100, humidValue % 100);
-        send_data(str, strlen(str));
-        etimer_reset(&sensor_timer);
-    } else if (ev == PROCESS_EVENT_TIMER && etimer_expired(&energest_timer)) {
-        /* Toplam enerji verilerini ve sensör değerlerini UDP ile gönder */
+      send_data(str, strlen(str));
+      etimer_reset(&sensor_timer);
+      if(++counter == 288) {
         send_energest_data();
-        etimer_reset(&energest_timer);
+        counter = 0;
+      }
+      
     }
   }
   
