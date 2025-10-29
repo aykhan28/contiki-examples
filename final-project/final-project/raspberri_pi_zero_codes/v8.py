@@ -15,14 +15,22 @@ BAUD_RATE = 115200
 
 # HTTP hedef ayarları
 TARGET_URL = 'http://10.142.1.191:5000/data'  # HTTP URL
+ERROR_URL = 'http://10.142.1.191:5000/error'  # Hata bildirimi için endpoint
 
 # SQLite veritabanı ayarları
 DB_PATH = 'offline_data.db'
 
+# Hata kontrol ayarları
+DATA_TIMEOUT = 600  # 10 dakika (saniye cinsinden)
+ERROR_REPORT_INTERVAL = 600  # 10 dakika (saniye cinsinden) - Hata mesajı gönderme aralığı
+
 class SensorDataSender:
     def __init__(self):
         self.init_database()
-        self.init_serial()
+        self.serial_connected = False
+        self.last_data_time = None
+        self.last_serial_error_time = 0
+        self.last_data_timeout_error_time = 0
 
     def init_database(self):
         """SQLite veritabanını başlat"""
@@ -43,14 +51,75 @@ class SensorDataSender:
         """Seri portu başlat"""
         try:
             self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+            self.serial_connected = True
             print(f"Seri port açıldı: {SERIAL_PORT}")
+            return True
         except serial.SerialException as e:
+            self.serial_connected = False
             print(f"Seri port açılamadı: {e}")
-            exit(1)
+            return False
             
     def get_timestamp(self):
         """ISO formatında zaman damgası döndür"""
         return datetime.now().isoformat()
+        
+    def send_error_to_server(self, error_type, error_message):
+        """Hata mesajını sunucuya gönder"""
+        payload = {
+            'error_type': error_type,
+            'error_message': error_message,
+            'timestamp': self.get_timestamp()
+        }
+        
+        try:
+            response = requests.post(
+                ERROR_URL,
+                json=payload,
+                timeout=3
+            )
+            
+            if response.status_code == 200:
+                print(f"Hata mesajı sunucuya gönderildi: {error_type}")
+                return True
+            else:
+                print(f"Hata mesajı gönderilemedi: {response.status_code}")
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            print(f"Hata mesajı gönderme başarısız: {e}")
+            return False
+    
+    def check_and_report_errors(self):
+        """
+        Hataları kontrol et ve 10 dakikada bir sunucuya bildir
+        """
+        current_time = time.time()
+        
+        # Seri port hata kontrolü
+        if not self.serial_connected:
+            # Son hata mesajından 10 dakika geçtiyse tekrar gönder
+            if current_time - self.last_serial_error_time >= ERROR_REPORT_INTERVAL:
+                print(f"HATA: Seri port bağlı değil - Sunucuya bildiriliyor")
+                self.send_error_to_server(
+                    'serial_port_error',
+                    'Seri port bağlantısı kurulamadı veya kesildi'
+                )
+                self.last_serial_error_time = current_time
+        
+        # Veri timeout kontrolü (sadece seri port bağlıyken)
+        if self.serial_connected and self.last_data_time is not None:
+            time_since_last_data = current_time - self.last_data_time
+            
+            # 10 dakikadan fazla veri gelmemişse
+            if time_since_last_data > DATA_TIMEOUT:
+                # Son hata mesajından 10 dakika geçtiyse tekrar gönder
+                if current_time - self.last_data_timeout_error_time >= ERROR_REPORT_INTERVAL:
+                    print(f"HATA: {int(time_since_last_data)} saniyedir veri gelmiyor - Sunucuya bildiriliyor")
+                    self.send_error_to_server(
+                        'data_timeout',
+                        f'{int(time_since_last_data)} saniyedir veri gelmedi'
+                    )
+                    self.last_data_timeout_error_time = current_time
         
     def parse_sensor_data(self, data_str):
         """Sensör verisini parse et ve JSON formatına çevir"""
@@ -189,7 +258,9 @@ class SensorDataSender:
         """Ana döngü"""
         print("Sensör veri aktarımı başlatıldı...")
         print("Tüm gelen veriler sunucuya gönderilecek.")
-        print(f"Hedef URL: {TARGET_URL}\n")
+        print(f"Hedef URL: {TARGET_URL}")
+        print(f"Hata URL: {ERROR_URL}")
+        print(f"Hata raporlama aralığı: {ERROR_REPORT_INTERVAL} saniye (10 dakika)\n")
         
         # Program başladığında offline verileri göndermeyi dene
         if self.check_connection():
@@ -197,39 +268,99 @@ class SensorDataSender:
             self.send_offline_data()
         else:
             print("Sunucu bağlantısı yok, offline modda başlanıyor...")
+        
+        # Seri portu başlat
+        if not self.init_serial():
+            print("Seri port bağlanamadı, ilk hata mesajı sunucuya gönderiliyor...")
+            self.send_error_to_server(
+                'serial_port_error',
+                'Seri port bağlantısı kurulamadı'
+            )
+            self.last_serial_error_time = time.time()
             
         buffer = ""  # Veri biriktirme buffer'ı
+        last_error_check_time = time.time()
+        serial_retry_time = time.time()
+        SERIAL_RETRY_INTERVAL = 30  # 30 saniyede bir seri port bağlantısını dene
             
         try:
             while True:
-                if self.ser.in_waiting > 0:
-                    # Gelen veriyi buffer'a ekle
-                    new_data = self.ser.read(self.ser.in_waiting).decode(errors='ignore')
-                    buffer += new_data
+                current_time = time.time()
+                
+                # Seri port bağlı değilse periyodik olarak bağlanmayı dene
+                if not self.serial_connected:
+                    if current_time - serial_retry_time > SERIAL_RETRY_INTERVAL:
+                        print("Seri port bağlantısı deneniyor...")
+                        if self.init_serial():
+                            print("Seri port bağlantısı başarılı!")
+                            self.last_data_time = time.time()  # Bağlantı kurulduğunda zamanı sıfırla
+                        serial_retry_time = current_time
                     
-                    # Satır sonlarına göre veriyi böl
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        line = line.strip()
+                    # Hata kontrolü ve raporlama (10 dakikada bir)
+                    if current_time - last_error_check_time >= 60:  # Her 1 dakikada kontrol et
+                        self.check_and_report_errors()
+                        last_error_check_time = current_time
+                    
+                    time.sleep(1)
+                    continue
+                
+                # Seri port bağlıysa veri oku
+                try:
+                    if self.ser.in_waiting > 0:
+                        # Gelen veriyi buffer'a ekle
+                        new_data = self.ser.read(self.ser.in_waiting).decode(errors='ignore')
+                        buffer += new_data
                         
-                        if line:
-                            # Veriyi parse et
-                            parsed_json = self.parse_sensor_data(line)
+                        # Satır sonlarına göre veriyi böl
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            line = line.strip()
                             
-                            if parsed_json:
-                                timestamp = self.get_timestamp()
-                                print(f"İşlenen veri: {line}")
+                            if line:
+                                # Veriyi parse et
+                                parsed_json = self.parse_sensor_data(line)
                                 
-                                # Önce sunucuya göndermeyi dene
-                                if self.send_to_server(parsed_json, timestamp):
-                                    # Başarılı gönderim sonrası offline verileri kontrol et
-                                    self.send_offline_data()
+                                if parsed_json:
+                                    timestamp = self.get_timestamp()
+                                    print(f"İşlenen veri: {line}")
+                                    
+                                    # Veri gelme zamanını güncelle
+                                    self.last_data_time = time.time()
+                                    
+                                    # Önce sunucuya göndermeyi dene
+                                    if self.send_to_server(parsed_json, timestamp):
+                                        # Başarılı gönderim sonrası offline verileri kontrol et
+                                        self.send_offline_data()
+                                    else:
+                                        # Başarısız gönderim, yerel veritabanına kaydet
+                                        self.save_to_database(parsed_json, timestamp)
                                 else:
-                                    # Başarısız gönderim, yerel veritabanına kaydet
-                                    self.save_to_database(parsed_json, timestamp)
-                            else:
-                                # Parse edilemeyen veriler için bilgi ver
-                                print(f"Parse edilemeyen veri atlandı: {line}")
+                                    # Parse edilemeyen veriler için bilgi ver
+                                    print(f"Parse edilemeyen veri atlandı: {line}")
+                
+                except serial.SerialException as e:
+                    print(f"Seri port okuma hatası: {e}")
+                    self.serial_connected = False
+                    if hasattr(self, 'ser'):
+                        try:
+                            self.ser.close()
+                        except:
+                            pass
+                    
+                    # Hata zamanını güncelle
+                    self.last_serial_error_time = time.time()
+                    self.send_error_to_server(
+                        'serial_port_error',
+                        f'Seri port bağlantısı kesildi: {str(e)}'
+                    )
+                    
+                    serial_retry_time = time.time()
+                    continue
+                
+                # Her 1 dakikada bir hata kontrolü yap (10 dakikada bir gönderim yapılacak)
+                if current_time - last_error_check_time >= 60:
+                    self.check_and_report_errors()
+                    last_error_check_time = current_time
 
                 # Kısa bir bekleme
                 time.sleep(0.1)
@@ -241,9 +372,12 @@ class SensorDataSender:
             
     def cleanup(self):
         """Temizlik işlemleri"""
-        if hasattr(self, 'ser'):
-            self.ser.close()
-            print("Seri port kapatıldı")
+        if hasattr(self, 'ser') and self.serial_connected:
+            try:
+                self.ser.close()
+                print("Seri port kapatıldı")
+            except:
+                pass
         if hasattr(self, 'conn'):
             self.conn.close()
             print("Veritabanı bağlantısı kapatıldı")
