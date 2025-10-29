@@ -1,0 +1,3 @@
+v8.py - Ana Kod. Seri portdan verileri alır ve server'a gönderir, bağlantı olmadığında yerel veritabanına kaydeder ve bağlantı geldiğinde kaydedilen verileri de (geldiği zamana göre) gönderir.
+v3.service - Systemd içinde yer alan servis kodu. Güç verildiğinde direkt çalışır. /etc/systemd/system dizininde olmalıdır.
+lowpower_setup.sh - Enerji tasarrufu için gereksiz servisleri kapatan script. chmod +x lowpower_setup.sh diye yetkilendirilip, sudo bash lowpower_setup.sh diye çalıştırılır. Bir kere çalıştırmak yeterlidir (çünkü kalıcıdır).
